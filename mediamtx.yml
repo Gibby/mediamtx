@@ -14,9 +14,9 @@ readTimeout: 10s
 # Timeout of write operations.
 writeTimeout: 10s
 # Number of read buffers.
-# A higher value allows a wider throughput, a lower value allows to save RAM.
+# A higher value allows to increase throughput, a lower value allows to save RAM.
 readBufferCount: 512
-# Maximum size of payload of outgoing UDP packets.
+# Maximum size of outgoing UDP packets.
 # This can be decreased to avoid fragmentation on networks with a low UDP MTU.
 udpMaxPayloadSize: 1472
 
@@ -53,18 +53,19 @@ pprof: no
 pprofAddress: 127.0.0.1:9999
 
 # Command to run when a client connects to the server.
+# Prepend ./ to run an executable in the current folder (example: "./ffmpeg")
 # This is terminated with SIGINT when a client disconnects from the server.
 # The following environment variables are available:
-# * RTSP_PORT: server port
+# * RTSP_PORT: RTSP server port
 runOnConnect:
-# Restart the command if it exits suddenly.
+# Restart the command if it exits.
 runOnConnectRestart: no
 
 ###############################################
 # RTSP parameters
 
-# Disable support for the RTSP protocol.
-rtspDisable: no
+# Enable support for the RTSP protocol.
+rtsp: yes
 # List of enabled RTSP transport protocols.
 # UDP is the most performant, but doesn't work when there's a NAT/firewall between
 # server and clients, and doesn't support encryption.
@@ -103,8 +104,8 @@ authMethods: [basic]
 ###############################################
 # RTMP parameters
 
-# Disable support for the RTMP protocol.
-rtmpDisable: no
+# Enable support for the RTMP protocol.
+rtmp: yes
 # Address of the RTMP listener. This is needed only when encryption is "no" or "optional".
 rtmpAddress: :1935
 # Encrypt connections with TLS (RTMPS).
@@ -123,8 +124,8 @@ rtmpServerCert: server.crt
 ###############################################
 # HLS parameters
 
-# Disable support for the HLS protocol.
-hlsDisable: no
+# Enable support for the HLS protocol.
+hls: yes
 # Address of the HLS listener.
 hlsAddress: :8888
 # Enable TLS/HTTPS on the HLS server.
@@ -179,8 +180,8 @@ hlsDirectory: ''
 ###############################################
 # WebRTC parameters
 
-# Disable support for the WebRTC protocol.
-webrtcDisable: no
+# Enable support for the WebRTC protocol.
+webrtc: yes
 # Address of the WebRTC listener.
 webrtcAddress: :8889
 # Enable TLS/HTTPS on the WebRTC server.
@@ -199,47 +200,63 @@ webrtcAllowOrigin: '*'
 # If the server receives a request from one of these entries, IP in logs
 # will be taken from the X-Forwarded-For header.
 webrtcTrustedProxies: []
-# List of ICE servers, in format type:user:pass:host:port or type:host:port.
-# type can be "stun", "turn" or "turns".
-# STUN servers are used to get the public IP of both server and clients.
-# TURN/TURNS servers are used as relay when a direct connection between server and clients is not possible.
-# if user is "AUTH_SECRET", then authentication is secret based.
-# the secret must be inserted into the pass field.
-webrtcICEServers: [stun:stun.l.google.com:19302]
+# List of ICE servers.
+webrtcICEServers2:
+  # URL can point to a STUN, TURN or TURNS server.
+  # STUN servers are used to obtain the public IP of server and clients. They are
+  # needed when server and clients are on different LANs.
+  # TURN/TURNS servers are needed when a direct connection between server and
+  # clients is not possible. All traffic is routed through them.
+- url: stun:stun.l.google.com:19302
+  # if user is "AUTH_SECRET", then authentication is secret based.
+  # the secret must be inserted into the password field.
+  username: ''
+  password: ''
 # List of public IP addresses that are to be used as a host.
 # This is used typically for servers that are behind 1:1 D-NAT.
 webrtcICEHostNAT1To1IPs: []
 # Address of a ICE UDP listener in format host:port.
-# If filled, ICE traffic will come through a single UDP port,
+# If filled, ICE traffic will pass through a single UDP port,
 # allowing the deployment of the server inside a container or behind a NAT.
 webrtcICEUDPMuxAddress:
 # Address of a ICE TCP listener in format host:port.
-# If filled, ICE traffic will come through a single TCP port,
+# If filled, ICE traffic will pass through a single TCP port,
 # allowing the deployment of the server inside a container or behind a NAT.
-# At the moment, setting this parameter forces usage of the TCP protocol,
-# which is not optimal for WebRTC.
+# Setting this parameter forces usage of the TCP protocol, which is not
+# optimal for WebRTC.
 webrtcICETCPMuxAddress:
+
+###############################################
+# SRT parameters
+
+# Enables support for the SRT protocol.
+srt: yes
+# Address of the SRT listener.
+srtAddress: :8890
 
 ###############################################
 # Path parameters
 
 # These settings are path-dependent, and the map key is the name of the path.
-# It's possible to use regular expressions by using a tilde as prefix.
-# For example, "~^(test1|test2)$" will match both "test1" and "test2".
-# For example, "~^prefix" will match all paths that start with "prefix".
-# The settings under the path "all" are applied to all paths that do not match
+# It's possible to use regular expressions by using a tilde as prefix,
+# for example "~^(test1|test2)$" will match both "test1" and "test2",
+# for example "~^prefix" will match all paths that start with "prefix".
+# Settings under the path "all" are applied to all paths that do not match
 # another entry.
 paths:
   all:
     # Source of the stream. This can be:
-    # * publisher -> the stream is published by a RTSP or RTMP client
+    # * publisher -> the stream is published by a RTSP, RTMP, WebRTC or SRT client
     # * rtsp://existing-url -> the stream is pulled from another RTSP server / camera
     # * rtsps://existing-url -> the stream is pulled from another RTSP server / camera with RTSPS
     # * rtmp://existing-url -> the stream is pulled from another RTMP server / camera
     # * rtmps://existing-url -> the stream is pulled from another RTMP server / camera with RTMPS
     # * http://existing-url/stream.m3u8 -> the stream is pulled from another HLS server
     # * https://existing-url/stream.m3u8 -> the stream is pulled from another HLS server with HTTPS
-    # * udp://ip:port -> the stream is pulled from UDP, by listening on the specified IP and port
+    # * udp://ip:port -> the stream is pulled with UDP, by listening on the specified IP and port
+    # * srt://existing-url -> the stream is pulled from another SRT server
+    # * whep://existing-url -> the stream is pulled from another WebRTC server
+    # * wheps://existing-url -> the stream is pulled from another WebRTC server with HTTPS
     # * redirect -> the stream is provided by another path or server
     # * rpiCamera -> the stream is provided by a Raspberry Pi Camera
     source: publisher
@@ -262,6 +279,8 @@ paths:
     # If sourceOnDemand is "yes", the source will be closed when there are no
     # readers connected and this amount of time has passed.
     sourceOnDemandCloseAfter: 10s
+    # Maximum number of readers. Zero means no limit.
+    maxReaders: 0
 
     ###############################################
     # Authentication path parameters
@@ -287,8 +306,8 @@ paths:
     ###############################################
     # Publisher path parameters (when source is "publisher")
 
-    # do not allow another client to disconnect the current publisher and publish in its place.
-    disablePublisherOverride: no
+    # allow another client to disconnect the current publisher and publish in its place.
+    overridePublisher: yes
     # if no one is publishing, redirect readers to this path.
     # It can be can be a relative path  (i.e. /otherstream) or an absolute RTSP URL.
     fallback:
@@ -360,6 +379,8 @@ paths:
     rpiCameraEV: 0
     # Region of interest, in format x,y,width,height
     rpiCameraROI:
+    # whether to enable HDR on Raspberry Camera 3.
+    rpiCameraHDR: false
     # tuning file
     rpiCameraTuningFile:
     # sensor mode, in format [width]:[height]:[bit-depth]:[packing]
@@ -404,26 +425,28 @@ paths:
 
     # Command to run when this path is initialized.
     # This can be used to publish a stream and keep it always opened.
+    # Prepend ./ to run an executable in the current folder (example: "./ffmpeg")
     # This is terminated with SIGINT when the program closes.
     # The following environment variables are available:
-    # * RTSP_PATH: path name
-    # * RTSP_PORT: server port
+    # * MTX_PATH: path name
+    # * RTSP_PORT: RTSP server port
     # * G1, G2, ...: regular expression groups, if path name is
     #   a regular expression.
     runOnInit:
-    # Restart the command if it exits suddenly.
+    # Restart the command if it exits.
     runOnInitRestart: no
 
     # Command to run when this path is requested.
     # This can be used to publish a stream on demand.
+    # Prepend ./ to run an executable in the current folder (example: "./ffmpeg")
     # This is terminated with SIGINT when the path is not requested anymore.
     # The following environment variables are available:
-    # * RTSP_PATH: path name
-    # * RTSP_PORT: server port
+    # * MTX_PATH: path name
+    # * RTSP_PORT: RTSP server port
     # * G1, G2, ...: regular expression groups, if path name is
     #   a regular expression.
     runOnDemand:
-    # Restart the command if it exits suddenly.
+    # Restart the command if it exits.
     runOnDemandRestart: no
     # Readers will be put on hold until the runOnDemand command starts publishing
     # or until this amount of time has passed.
@@ -434,23 +457,25 @@ paths:
 
     # Command to run when the stream is ready to be read, whether it is
     # published by a client or pulled from a server / camera.
+    # Prepend ./ to run an executable in the current folder (example: "./ffmpeg")
     # This is terminated with SIGINT when the stream is not ready anymore.
     # The following environment variables are available:
-    # * RTSP_PATH: path name
-    # * RTSP_PORT: server port
+    # * MTX_PATH: path name
+    # * RTSP_PORT: RTSP server port
     # * G1, G2, ...: regular expression groups, if path name is
     #   a regular expression.
     runOnReady:
-    # Restart the command if it exits suddenly.
+    # Restart the command if it exits.
     runOnReadyRestart: no
 
     # Command to run when a clients starts reading.
+    # Prepend ./ to run an executable in the current folder (example: "./ffmpeg")
     # This is terminated with SIGINT when a client stops reading.
     # The following environment variables are available:
-    # * RTSP_PATH: path name
-    # * RTSP_PORT: server port
+    # * MTX_PATH: path name
+    # * RTSP_PORT: RTSP server port
     # * G1, G2, ...: regular expression groups, if path name is
     #   a regular expression.
     runOnRead:
-    # Restart the command if it exits suddenly.
+    # Restart the command if it exits.
     runOnReadRestart: no

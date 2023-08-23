@@ -1,10 +1,7 @@
 package core
 
 import (
-	"context"
 	"io"
-	"log"
-	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -13,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/httpserv"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
@@ -27,8 +25,7 @@ type metricsParent interface {
 type metrics struct {
 	parent metricsParent
 
-	ln            net.Listener
-	httpServer    *http.Server
+	httpServer    *httpserv.WrappedServer
 	mutex         sync.Mutex
 	pathManager   apiPathManager
 	rtspServer    apiRTSPServer
@@ -43,40 +40,39 @@ func newMetrics(
 	readTimeout conf.StringDuration,
 	parent metricsParent,
 ) (*metrics, error) {
-	ln, err := net.Listen(restrictNetwork("tcp", address))
+	m := &metrics{
+		parent: parent,
+	}
+
+	router := gin.New()
+	router.SetTrustedProxies(nil) //nolint:errcheck
+
+	router.GET("/metrics", m.onMetrics)
+
+	network, address := restrictNetwork("tcp", address)
+
+	var err error
+	m.httpServer, err = httpserv.NewWrappedServer(
+		network,
+		address,
+		time.Duration(readTimeout),
+		"",
+		"",
+		router,
+		m,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	m := &metrics{
-		parent: parent,
-		ln:     ln,
-	}
-
-	router := gin.New()
-	router.SetTrustedProxies(nil)
-
-	mwLog := httpLoggerMiddleware(m)
-	router.NoRoute(mwLog)
-	router.GET("/metrics", mwLog, m.onMetrics)
-
-	m.httpServer = &http.Server{
-		Handler:           router,
-		ReadHeaderTimeout: time.Duration(readTimeout),
-		ErrorLog:          log.New(&nilWriter{}, "", 0),
-	}
-
 	m.Log(logger.Info, "listener opened on "+address)
-
-	go m.httpServer.Serve(m.ln)
 
 	return m, nil
 }
 
 func (m *metrics) close() {
 	m.Log(logger.Info, "listener is closing")
-	m.httpServer.Shutdown(context.Background())
-	m.ln.Close() // in case Shutdown() is called before Serve()
+	m.httpServer.Close()
 }
 
 func (m *metrics) Log(level logger.Level, format string, args ...interface{}) {
@@ -86,9 +82,9 @@ func (m *metrics) Log(level logger.Level, format string, args ...interface{}) {
 func (m *metrics) onMetrics(ctx *gin.Context) {
 	out := ""
 
-	res := m.pathManager.apiPathsList()
-	if res.err == nil && len(res.data.Items) != 0 {
-		for _, i := range res.data.Items {
+	data, err := m.pathManager.apiPathsList()
+	if err == nil && len(data.Items) != 0 {
+		for _, i := range data.Items {
 			var state string
 			if i.SourceReady {
 				state = "ready"
@@ -105,9 +101,9 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 	}
 
 	if !interfaceIsEmpty(m.hlsManager) {
-		res := m.hlsManager.apiMuxersList()
-		if res.err == nil && len(res.data.Items) != 0 {
-			for _, i := range res.data.Items {
+		data, err := m.hlsManager.apiMuxersList()
+		if err == nil && len(data.Items) != 0 {
+			for _, i := range data.Items {
 				tags := "{name=\"" + i.Path + "\"}"
 				out += metric("hls_muxers", tags, 1)
 				out += metric("hls_muxers_bytes_sent", tags, int64(i.BytesSent))
@@ -120,9 +116,9 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 
 	if !interfaceIsEmpty(m.rtspServer) { //nolint:dupl
 		func() {
-			res := m.rtspServer.apiConnsList()
-			if res.err == nil && len(res.data.Items) != 0 {
-				for _, i := range res.data.Items {
+			data, err := m.rtspServer.apiConnsList()
+			if err == nil && len(data.Items) != 0 {
+				for _, i := range data.Items {
 					tags := "{id=\"" + i.ID.String() + "\"}"
 					out += metric("rtsp_conns", tags, 1)
 					out += metric("rtsp_conns_bytes_received", tags, int64(i.BytesReceived))
@@ -136,10 +132,10 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 		}()
 
 		func() {
-			res := m.rtspServer.apiSessionsList()
-			if res.err == nil && len(res.data.Items) != 0 {
-				for _, i := range res.data.Items {
-					tags := "{id=\"" + i.ID.String() + "\",state=\"" + i.State + "\"}"
+			data, err := m.rtspServer.apiSessionsList()
+			if err == nil && len(data.Items) != 0 {
+				for _, i := range data.Items {
+					tags := "{id=\"" + i.ID.String() + "\",state=\"" + string(i.State) + "\"}"
 					out += metric("rtsp_sessions", tags, 1)
 					out += metric("rtsp_sessions_bytes_received", tags, int64(i.BytesReceived))
 					out += metric("rtsp_sessions_bytes_sent", tags, int64(i.BytesSent))
@@ -154,9 +150,9 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 
 	if !interfaceIsEmpty(m.rtspsServer) { //nolint:dupl
 		func() {
-			res := m.rtspsServer.apiConnsList()
-			if res.err == nil && len(res.data.Items) != 0 {
-				for _, i := range res.data.Items {
+			data, err := m.rtspsServer.apiConnsList()
+			if err == nil && len(data.Items) != 0 {
+				for _, i := range data.Items {
 					tags := "{id=\"" + i.ID.String() + "\"}"
 					out += metric("rtsps_conns", tags, 1)
 					out += metric("rtsps_conns_bytes_received", tags, int64(i.BytesReceived))
@@ -170,10 +166,10 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 		}()
 
 		func() {
-			res := m.rtspsServer.apiSessionsList()
-			if res.err == nil && len(res.data.Items) != 0 {
-				for _, i := range res.data.Items {
-					tags := "{id=\"" + i.ID.String() + "\",state=\"" + i.State + "\"}"
+			data, err := m.rtspsServer.apiSessionsList()
+			if err == nil && len(data.Items) != 0 {
+				for _, i := range data.Items {
+					tags := "{id=\"" + i.ID.String() + "\",state=\"" + string(i.State) + "\"}"
 					out += metric("rtsps_sessions", tags, 1)
 					out += metric("rtsps_sessions_bytes_received", tags, int64(i.BytesReceived))
 					out += metric("rtsps_sessions_bytes_sent", tags, int64(i.BytesSent))
@@ -187,10 +183,10 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 	}
 
 	if !interfaceIsEmpty(m.rtmpServer) {
-		res := m.rtmpServer.apiConnsList()
-		if res.err == nil && len(res.data.Items) != 0 {
-			for _, i := range res.data.Items {
-				tags := "{id=\"" + i.ID.String() + "\",state=\"" + i.State + "\"}"
+		data, err := m.rtmpServer.apiConnsList()
+		if err == nil && len(data.Items) != 0 {
+			for _, i := range data.Items {
+				tags := "{id=\"" + i.ID.String() + "\",state=\"" + string(i.State) + "\"}"
 				out += metric("rtmp_conns", tags, 1)
 				out += metric("rtmp_conns_bytes_received", tags, int64(i.BytesReceived))
 				out += metric("rtmp_conns_bytes_sent", tags, int64(i.BytesSent))
@@ -203,9 +199,9 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 	}
 
 	if !interfaceIsEmpty(m.webRTCManager) {
-		res := m.webRTCManager.apiSessionsList()
-		if res.err == nil && len(res.data.Items) != 0 {
-			for _, i := range res.data.Items {
+		data, err := m.webRTCManager.apiSessionsList()
+		if err == nil && len(data.Items) != 0 {
+			for _, i := range data.Items {
 				tags := "{id=\"" + i.ID.String() + "\"}"
 				out += metric("webrtc_sessions", tags, 1)
 				out += metric("webrtc_sessions_bytes_received", tags, int64(i.BytesReceived))
@@ -219,7 +215,7 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 	}
 
 	ctx.Writer.WriteHeader(http.StatusOK)
-	io.WriteString(ctx.Writer, out)
+	io.WriteString(ctx.Writer, out) //nolint:errcheck
 }
 
 // pathManagerSet is called by pathManager.
@@ -229,8 +225,8 @@ func (m *metrics) pathManagerSet(s apiPathManager) {
 	m.pathManager = s
 }
 
-// hlsManagerSet is called by hlsManager.
-func (m *metrics) hlsManagerSet(s apiHLSManager) {
+// setHLSManager is called by hlsManager.
+func (m *metrics) setHLSManager(s apiHLSManager) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.hlsManager = s

@@ -12,18 +12,7 @@ import (
 
 // UnitGeneric is a generic data unit.
 type UnitGeneric struct {
-	RTPPackets []*rtp.Packet
-	NTP        time.Time
-}
-
-// GetRTPPackets implements Unit.
-func (d *UnitGeneric) GetRTPPackets() []*rtp.Packet {
-	return d.RTPPackets
-}
-
-// GetNTP implements Unit.
-func (d *UnitGeneric) GetNTP() time.Time {
-	return d.NTP
+	BaseUnit
 }
 
 type formatProcessorGeneric struct {
@@ -34,7 +23,7 @@ func newGeneric(
 	udpMaxPayloadSize int,
 	forma formats.Format,
 	generateRTPPackets bool,
-	log logger.Writer,
+	_ logger.Writer,
 ) (*formatProcessorGeneric, error) {
 	if generateRTPPackets {
 		return nil, fmt.Errorf("we don't know how to generate RTP packets of format %+v", forma)
@@ -45,7 +34,7 @@ func newGeneric(
 	}, nil
 }
 
-func (t *formatProcessorGeneric) Process(unit Unit, hasNonRTSPReaders bool) error {
+func (t *formatProcessorGeneric) Process(unit Unit, _ bool) error {
 	tunit := unit.(*UnitGeneric)
 
 	pkt := tunit.RTPPackets[0]
@@ -64,7 +53,9 @@ func (t *formatProcessorGeneric) Process(unit Unit, hasNonRTSPReaders bool) erro
 
 func (t *formatProcessorGeneric) UnitForRTPPacket(pkt *rtp.Packet, ntp time.Time) Unit {
 	return &UnitGeneric{
-		RTPPackets: []*rtp.Packet{pkt},
-		NTP:        ntp,
+		BaseUnit: BaseUnit{
+			RTPPackets: []*rtp.Packet{pkt},
+			NTP:        ntp,
+		},
 	}
 }

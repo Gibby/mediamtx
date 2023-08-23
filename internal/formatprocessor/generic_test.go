@@ -13,7 +13,8 @@ func TestGenericRemovePadding(t *testing.T) {
 		PayloadTyp: 96,
 		RTPMa:      "private/90000",
 	}
-	forma.Init()
+	err := forma.Init()
+	require.NoError(t, err)
 
 	p, err := New(1472, forma, false, nil)
 	require.NoError(t, err)
@@ -33,7 +34,9 @@ func TestGenericRemovePadding(t *testing.T) {
 	}
 
 	err = p.Process(&UnitGeneric{
-		RTPPackets: []*rtp.Packet{pkt},
+		BaseUnit: BaseUnit{
+			RTPPackets: []*rtp.Packet{pkt},
+		},
 	}, false)
 	require.NoError(t, err)
 

@@ -4,6 +4,7 @@ package conf
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -43,8 +44,9 @@ func loadFromFile(fpath string, conf *Conf) (bool, error) {
 	// mediamtx.yml is optional
 	// other configuration files are not
 	if fpath == "mediamtx.yml" || fpath == "rtsp-simple-server.yml" {
-		if _, err := os.Stat(fpath); err != nil {
-			conf.UnmarshalJSON(nil) // load defaults
+		if _, err := os.Stat(fpath); errors.Is(err, os.ErrNotExist) {
+			// load defaults
+			conf.UnmarshalJSON(nil) //nolint:errcheck
 			return false, nil
 		}
 	}
@@ -76,6 +78,15 @@ func loadFromFile(fpath string, conf *Conf) (bool, error) {
 	return true, nil
 }
 
+func contains(list []headers.AuthMethod, item headers.AuthMethod) bool {
+	for _, i := range list {
+		if i == item {
+			return true
+		}
+	}
+	return false
+}
+
 // Conf is a configuration.
 type Conf struct {
 	// general
@@ -97,7 +108,8 @@ type Conf struct {
 	RunOnConnectRestart       bool            `json:"runOnConnectRestart"`
 
 	// RTSP
-	RTSPDisable       bool        `json:"rtspDisable"`
+	RTSP              bool        `json:"rtsp"`
+	RTSPDisable       bool        `json:"rtspDisable"` // deprecated
 	Protocols         Protocols   `json:"protocols"`
 	Encryption        Encryption  `json:"encryption"`
 	RTSPAddress       string      `json:"rtspAddress"`
@@ -112,7 +124,8 @@ type Conf struct {
 	AuthMethods       AuthMethods `json:"authMethods"`
 
 	// RTMP
-	RTMPDisable    bool       `json:"rtmpDisable"`
+	RTMP           bool       `json:"rtmp"`
+	RTMPDisable    bool       `json:"rtmpDisable"` // deprecated
 	RTMPAddress    string     `json:"rtmpAddress"`
 	RTMPEncryption Encryption `json:"rtmpEncryption"`
 	RTMPSAddress   string     `json:"rtmpsAddress"`
@@ -120,7 +133,8 @@ type Conf struct {
 	RTMPServerCert string     `json:"rtmpServerCert"`
 
 	// HLS
-	HLSDisable         bool           `json:"hlsDisable"`
+	HLS                bool           `json:"hls"`
+	HLSDisable         bool           `json:"hlsDisable"` // depreacted
 	HLSAddress         string         `json:"hlsAddress"`
 	HLSEncryption      bool           `json:"hlsEncryption"`
 	HLSServerKey       string         `json:"hlsServerKey"`
@@ -136,17 +150,23 @@ type Conf struct {
 	HLSDirectory       string         `json:"hlsDirectory"`
 
 	// WebRTC
-	WebRTCDisable           bool       `json:"webrtcDisable"`
-	WebRTCAddress           string     `json:"webrtcAddress"`
-	WebRTCEncryption        bool       `json:"webrtcEncryption"`
-	WebRTCServerKey         string     `json:"webrtcServerKey"`
-	WebRTCServerCert        string     `json:"webrtcServerCert"`
-	WebRTCAllowOrigin       string     `json:"webrtcAllowOrigin"`
-	WebRTCTrustedProxies    IPsOrCIDRs `json:"webrtcTrustedProxies"`
-	WebRTCICEServers        []string   `json:"webrtcICEServers"`
-	WebRTCICEHostNAT1To1IPs []string   `json:"webrtcICEHostNAT1To1IPs"`
-	WebRTCICEUDPMuxAddress  string     `json:"webrtcICEUDPMuxAddress"`
-	WebRTCICETCPMuxAddress  string     `json:"webrtcICETCPMuxAddress"`
+	WebRTC                  bool              `json:"webrtc"`
+	WebRTCDisable           bool              `json:"webrtcDisable"` // deprecated
+	WebRTCAddress           string            `json:"webrtcAddress"`
+	WebRTCEncryption        bool              `json:"webrtcEncryption"`
+	WebRTCServerKey         string            `json:"webrtcServerKey"`
+	WebRTCServerCert        string            `json:"webrtcServerCert"`
+	WebRTCAllowOrigin       string            `json:"webrtcAllowOrigin"`
+	WebRTCTrustedProxies    IPsOrCIDRs        `json:"webrtcTrustedProxies"`
+	WebRTCICEServers        []string          `json:"webrtcICEServers"` // deprecated
+	WebRTCICEServers2       []WebRTCICEServer `json:"webrtcICEServers2"`
+	WebRTCICEHostNAT1To1IPs []string          `json:"webrtcICEHostNAT1To1IPs"`
+	WebRTCICEUDPMuxAddress  string            `json:"webrtcICEUDPMuxAddress"`
+	WebRTCICETCPMuxAddress  string            `json:"webrtcICETCPMuxAddress"`
+
+	// SRT
+	SRT        bool   `json:"srt"`
+	SRTAddress string `json:"srtAddress"`
 
 	// paths
 	Paths map[string]*PathConf `json:"paths"`
@@ -195,15 +215,6 @@ func (conf Conf) Clone() *Conf {
 	return &dest
 }
 
-func contains(list []headers.AuthMethod, item headers.AuthMethod) bool {
-	for _, i := range list {
-		if i == item {
-			return true
-		}
-	}
-	return false
-}
-
 // Check checks the configuration for errors.
 func (conf *Conf) Check() error {
 	// general
@@ -225,6 +236,9 @@ func (conf *Conf) Check() error {
 	}
 
 	// RTSP
+	if conf.RTSPDisable {
+		conf.RTSP = false
+	}
 	if conf.Encryption == EncryptionStrict {
 		if _, ok := conf.Protocols[Protocol(gortsplib.TransportUDP)]; ok {
 			return fmt.Errorf("strict encryption can't be used with the UDP transport protocol")
@@ -234,12 +248,40 @@ func (conf *Conf) Check() error {
 		}
 	}
 
+	// RTMP
+	if conf.RTMPDisable {
+		conf.RTMP = false
+	}
+
+	// HLS
+	if conf.HLSDisable {
+		conf.HLS = false
+	}
+
 	// WebRTC
+	if conf.WebRTCDisable {
+		conf.WebRTC = false
+	}
 	for _, server := range conf.WebRTCICEServers {
-		if !strings.HasPrefix(server, "stun:") &&
-			!strings.HasPrefix(server, "turn:") &&
-			!strings.HasPrefix(server, "turns:") {
-			return fmt.Errorf("invalid ICE server: '%s'", server)
+		parts := strings.Split(server, ":")
+		if len(parts) == 5 {
+			conf.WebRTCICEServers2 = append(conf.WebRTCICEServers2, WebRTCICEServer{
+				URL:      parts[0] + ":" + parts[3] + ":" + parts[4],
+				Username: parts[1],
+				Password: parts[2],
+			})
+		} else {
+			conf.WebRTCICEServers2 = append(conf.WebRTCICEServers2, WebRTCICEServer{
+				URL: server,
+			})
+		}
+	}
+	conf.WebRTCICEServers = nil
+	for _, server := range conf.WebRTCICEServers2 {
+		if !strings.HasPrefix(server.URL, "stun:") &&
+			!strings.HasPrefix(server.URL, "turn:") &&
+			!strings.HasPrefix(server.URL, "turns:") {
+			return fmt.Errorf("invalid ICE server: '%s'", server.URL)
 		}
 	}
 
@@ -249,17 +291,12 @@ func (conf *Conf) Check() error {
 		conf.Paths = make(map[string]*PathConf)
 	}
 
-	// "all" is an alias for "~^.*$"
-	if _, ok := conf.Paths["all"]; ok {
-		conf.Paths["~^.*$"] = conf.Paths["all"]
-		delete(conf.Paths, "all")
-	}
-
 	for _, name := range getSortedKeys(conf.Paths) {
 		pconf := conf.Paths[name]
 		if pconf == nil {
 			pconf = &PathConf{}
-			pconf.UnmarshalJSON(nil) // fill defaults
+			// load defaults
+			pconf.UnmarshalJSON(nil) //nolint:errcheck
 			conf.Paths[name] = pconf
 		}
 
@@ -287,6 +324,7 @@ func (conf *Conf) UnmarshalJSON(b []byte) error {
 	conf.PPROFAddress = "127.0.0.1:9999"
 
 	// RTSP
+	conf.RTSP = true
 	conf.Protocols = Protocols{
 		Protocol(gortsplib.TransportUDP):          {},
 		Protocol(gortsplib.TransportUDPMulticast): {},
@@ -304,10 +342,12 @@ func (conf *Conf) UnmarshalJSON(b []byte) error {
 	conf.AuthMethods = AuthMethods{headers.AuthBasic}
 
 	// RTMP
+	conf.RTMP = true
 	conf.RTMPAddress = ":1935"
 	conf.RTMPSAddress = ":1936"
 
 	// HLS
+	conf.HLS = true
 	conf.HLSAddress = ":8888"
 	conf.HLSServerKey = "server.key"
 	conf.HLSServerCert = "server.crt"
@@ -319,11 +359,16 @@ func (conf *Conf) UnmarshalJSON(b []byte) error {
 	conf.HLSAllowOrigin = "*"
 
 	// WebRTC
+	conf.WebRTC = true
 	conf.WebRTCAddress = ":8889"
 	conf.WebRTCServerKey = "server.key"
 	conf.WebRTCServerCert = "server.crt"
 	conf.WebRTCAllowOrigin = "*"
-	conf.WebRTCICEServers = []string{"stun:stun.l.google.com:19302"}
+	conf.WebRTCICEServers2 = []WebRTCICEServer{{URL: "stun:stun.l.google.com:19302"}}
+
+	// SRT
+	conf.SRT = true
+	conf.SRTAddress = ":8890"
 
 	type alias Conf
 	d := json.NewDecoder(bytes.NewReader(b))

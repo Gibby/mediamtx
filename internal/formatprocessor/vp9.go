@@ -13,20 +13,9 @@ import (
 
 // UnitVP9 is a VP9 data unit.
 type UnitVP9 struct {
-	RTPPackets []*rtp.Packet
-	NTP        time.Time
-	PTS        time.Duration
-	Frame      []byte
-}
-
-// GetRTPPackets implements Unit.
-func (d *UnitVP9) GetRTPPackets() []*rtp.Packet {
-	return d.RTPPackets
-}
-
-// GetNTP implements Unit.
-func (d *UnitVP9) GetNTP() time.Time {
-	return d.NTP
+	BaseUnit
+	PTS   time.Duration
+	Frame []byte
 }
 
 type formatProcessorVP9 struct {
@@ -40,7 +29,7 @@ func newVP9(
 	udpMaxPayloadSize int,
 	forma *formats.VP9,
 	generateRTPPackets bool,
-	log logger.Writer,
+	_ logger.Writer,
 ) (*formatProcessorVP9, error) {
 	t := &formatProcessorVP9{
 		udpMaxPayloadSize: udpMaxPayloadSize,
@@ -48,14 +37,21 @@ func newVP9(
 	}
 
 	if generateRTPPackets {
-		t.encoder = &rtpvp9.Encoder{
-			PayloadMaxSize: t.udpMaxPayloadSize - 12,
-			PayloadType:    forma.PayloadTyp,
+		err := t.createEncoder()
+		if err != nil {
+			return nil, err
 		}
-		t.encoder.Init()
 	}
 
 	return t, nil
+}
+
+func (t *formatProcessorVP9) createEncoder() error {
+	t.encoder = &rtpvp9.Encoder{
+		PayloadMaxSize: t.udpMaxPayloadSize - 12,
+		PayloadType:    t.format.PayloadTyp,
+	}
+	return t.encoder.Init()
 }
 
 func (t *formatProcessorVP9) Process(unit Unit, hasNonRTSPReaders bool) error { //nolint:dupl
@@ -76,12 +72,16 @@ func (t *formatProcessorVP9) Process(unit Unit, hasNonRTSPReaders bool) error { 
 		// decode from RTP
 		if hasNonRTSPReaders || t.decoder != nil {
 			if t.decoder == nil {
-				t.decoder = t.format.CreateDecoder()
+				var err error
+				t.decoder, err = t.format.CreateDecoder2()
+				if err != nil {
+					return err
+				}
 			}
 
 			frame, pts, err := t.decoder.Decode(pkt)
 			if err != nil {
-				if err == rtpvp9.ErrMorePacketsNeeded {
+				if err == rtpvp9.ErrNonStartingPacketAndNoPrevious || err == rtpvp9.ErrMorePacketsNeeded {
 					return nil
 				}
 				return err
@@ -107,7 +107,9 @@ func (t *formatProcessorVP9) Process(unit Unit, hasNonRTSPReaders bool) error { 
 
 func (t *formatProcessorVP9) UnitForRTPPacket(pkt *rtp.Packet, ntp time.Time) Unit {
 	return &UnitVP9{
-		RTPPackets: []*rtp.Packet{pkt},
-		NTP:        ntp,
+		BaseUnit: BaseUnit{
+			RTPPackets: []*rtp.Packet{pkt},
+			NTP:        ntp,
+		},
 	}
 }

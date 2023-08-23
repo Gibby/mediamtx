@@ -1,25 +1,22 @@
 package core
 
 import (
-	"context"
-	"crypto/tls"
 	_ "embed"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v3"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/httpserv"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/whip"
 )
 
 //go:embed webrtc_publish_index.html
@@ -28,89 +25,11 @@ var webrtcPublishIndex []byte
 //go:embed webrtc_read_index.html
 var webrtcReadIndex []byte
 
-func unmarshalICEFragment(buf []byte) ([]*webrtc.ICECandidateInit, error) {
-	buf = append([]byte("v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"), buf...)
-
-	var sdp sdp.SessionDescription
-	err := sdp.Unmarshal(buf)
-	if err != nil {
-		return nil, err
-	}
-
-	usernameFragment, ok := sdp.Attribute("ice-ufrag")
-	if !ok {
-		return nil, fmt.Errorf("ice-ufrag attribute is missing")
-	}
-
-	var ret []*webrtc.ICECandidateInit
-
-	for _, media := range sdp.MediaDescriptions {
-		mid, ok := media.Attribute("mid")
-		if !ok {
-			return nil, fmt.Errorf("mid attribute is missing")
-		}
-
-		tmp, err := strconv.ParseUint(mid, 10, 16)
-		if err != nil {
-			return nil, fmt.Errorf("invalid mid attribute")
-		}
-		midNum := uint16(tmp)
-
-		for _, attr := range media.Attributes {
-			if attr.Key == "candidate" {
-				ret = append(ret, &webrtc.ICECandidateInit{
-					Candidate:        attr.Value,
-					SDPMid:           &mid,
-					SDPMLineIndex:    &midNum,
-					UsernameFragment: &usernameFragment,
-				})
-			}
-		}
-	}
-
-	return ret, nil
-}
-
-func marshalICEFragment(offer *webrtc.SessionDescription, candidates []*webrtc.ICECandidateInit) ([]byte, error) {
-	var sdp sdp.SessionDescription
-	err := sdp.Unmarshal([]byte(offer.SDP))
-	if err != nil || len(sdp.MediaDescriptions) == 0 {
-		return nil, err
-	}
-
-	firstMedia := sdp.MediaDescriptions[0]
-	iceUfrag, _ := firstMedia.Attribute("ice-ufrag")
-	icePwd, _ := firstMedia.Attribute("ice-pwd")
-
-	candidatesByMedia := make(map[uint16][]*webrtc.ICECandidateInit)
-	for _, candidate := range candidates {
-		mid := *candidate.SDPMLineIndex
-		candidatesByMedia[mid] = append(candidatesByMedia[mid], candidate)
-	}
-
-	frag := "a=ice-ufrag:" + iceUfrag + "\r\n" +
-		"a=ice-pwd:" + icePwd + "\r\n"
-
-	for mid, media := range sdp.MediaDescriptions {
-		cbm, ok := candidatesByMedia[uint16(mid)]
-		if ok {
-			frag += "m=" + media.MediaName.String() + "\r\n" +
-				"a=mid:" + strconv.FormatUint(uint64(mid), 10) + "\r\n"
-
-			for _, candidate := range cbm {
-				frag += "a=" + candidate.Candidate + "\r\n"
-			}
-		}
-	}
-
-	return []byte(frag), nil
-}
-
 type webRTCHTTPServerParent interface {
 	logger.Writer
-	genICEServers() []webrtc.ICEServer
-	sessionNew(req webRTCSessionNewReq) webRTCSessionNewRes
-	sessionAddCandidates(req webRTCSessionAddCandidatesReq) webRTCSessionAddCandidatesRes
+	generateICEServers() ([]webrtc.ICEServer, error)
+	newSession(req webRTCNewSessionReq) webRTCNewSessionRes
+	addSessionCandidates(req webRTCAddSessionCandidatesReq) webRTCAddSessionCandidatesRes
 }
 
 type webRTCHTTPServer struct {
@@ -118,8 +37,7 @@ type webRTCHTTPServer struct {
 	pathManager *pathManager
 	parent      webRTCHTTPServerParent
 
-	ln    net.Listener
-	inner *http.Server
+	inner *httpserv.WrappedServer
 }
 
 func newWebRTCHTTPServer( //nolint:dupl
@@ -133,46 +51,39 @@ func newWebRTCHTTPServer( //nolint:dupl
 	pathManager *pathManager,
 	parent webRTCHTTPServerParent,
 ) (*webRTCHTTPServer, error) {
-	ln, err := net.Listen(restrictNetwork("tcp", address))
-	if err != nil {
-		return nil, err
-	}
-
-	var tlsConfig *tls.Config
 	if encryption {
-		crt, err := tls.LoadX509KeyPair(serverCert, serverKey)
-		if err != nil {
-			ln.Close()
-			return nil, err
+		if serverCert == "" {
+			return nil, fmt.Errorf("server cert is missing")
 		}
-
-		tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{crt},
-		}
+	} else {
+		serverKey = ""
+		serverCert = ""
 	}
 
 	s := &webRTCHTTPServer{
 		allowOrigin: allowOrigin,
 		pathManager: pathManager,
 		parent:      parent,
-		ln:          ln,
 	}
 
 	router := gin.New()
-	httpSetTrustedProxies(router, trustedProxies)
-	router.NoRoute(httpLoggerMiddleware(s), httpServerHeaderMiddleware, s.onRequest)
+	router.SetTrustedProxies(trustedProxies.ToTrustedProxies()) //nolint:errcheck
+	router.NoRoute(s.onRequest)
 
-	s.inner = &http.Server{
-		Handler:           router,
-		TLSConfig:         tlsConfig,
-		ReadHeaderTimeout: time.Duration(readTimeout),
-		ErrorLog:          log.New(&nilWriter{}, "", 0),
-	}
+	network, address := restrictNetwork("tcp", address)
 
-	if tlsConfig != nil {
-		go s.inner.ServeTLS(s.ln, "", "")
-	} else {
-		go s.inner.Serve(s.ln)
+	var err error
+	s.inner, err = httpserv.NewWrappedServer(
+		network,
+		address,
+		time.Duration(readTimeout),
+		serverCert,
+		serverKey,
+		router,
+		s,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	return s, nil
@@ -183,8 +94,7 @@ func (s *webRTCHTTPServer) Log(level logger.Level, format string, args ...interf
 }
 
 func (s *webRTCHTTPServer) close() {
-	s.inner.Shutdown(context.Background())
-	s.ln.Close() // in case Shutdown() is called before Serve()
+	s.inner.Close()
 }
 
 func (s *webRTCHTTPServer) onRequest(ctx *gin.Context) {
@@ -194,15 +104,19 @@ func (s *webRTCHTTPServer) onRequest(ctx *gin.Context) {
 	// remove leading prefix
 	pa := ctx.Request.URL.Path[1:]
 
-	if !strings.HasSuffix(pa, "/whip") && !strings.HasSuffix(pa, "/whep") {
-		switch ctx.Request.Method {
-		case http.MethodGet:
+	isWHIPorWHEP := strings.HasSuffix(pa, "/whip") || strings.HasSuffix(pa, "/whep")
+	isPreflight := ctx.Request.Method == http.MethodOptions &&
+		ctx.Request.Header.Get("Access-Control-Request-Method") != ""
 
+	if !isWHIPorWHEP || isPreflight {
+		switch ctx.Request.Method {
 		case http.MethodOptions:
-			ctx.Writer.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-			ctx.Writer.Header().Set("Access-Control-Allow-Headers", ctx.Request.Header.Get("Access-Control-Request-Headers"))
-			ctx.Writer.WriteHeader(http.StatusOK)
+			ctx.Writer.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PATCH")
+			ctx.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match")
+			ctx.Writer.WriteHeader(http.StatusNoContent)
 			return
+
+		case http.MethodGet:
 
 		default:
 			return
@@ -234,7 +148,11 @@ func (s *webRTCHTTPServer) onRequest(ctx *gin.Context) {
 		publish = false
 
 		if !strings.HasSuffix(dir, "/") {
-			ctx.Writer.Header().Set("Location", "/"+dir+"/")
+			l := "/" + dir + "/"
+			if ctx.Request.URL.RawQuery != "" {
+				l += "?" + ctx.Request.URL.RawQuery
+			}
+			ctx.Writer.Header().Set("Location", l)
 			ctx.Writer.WriteHeader(http.StatusMovedPermanently)
 			return
 		}
@@ -245,43 +163,55 @@ func (s *webRTCHTTPServer) onRequest(ctx *gin.Context) {
 		return
 	}
 
+	ip := ctx.ClientIP()
+	_, port, _ := net.SplitHostPort(ctx.Request.RemoteAddr)
+	remoteAddr := net.JoinHostPort(ip, port)
 	user, pass, hasCredentials := ctx.Request.BasicAuth()
 
-	res := s.pathManager.getPathConf(pathGetPathConfReq{
-		name:    dir,
-		publish: publish,
-		credentials: authCredentials{
-			query: ctx.Request.URL.RawQuery,
-			ip:    net.ParseIP(ctx.ClientIP()),
-			user:  user,
-			pass:  pass,
-			proto: authProtocolWebRTC,
-		},
-	})
-	if res.err != nil {
-		if terr, ok := res.err.(pathErrAuth); ok {
-			if !hasCredentials {
-				ctx.Header("WWW-Authenticate", `Basic realm="mediamtx"`)
+	// if request doesn't belong to a session, check authentication here
+	if !isWHIPorWHEP || ctx.Request.Method == http.MethodOptions {
+		res := s.pathManager.getConfForPath(pathGetConfForPathReq{
+			name:    dir,
+			publish: publish,
+			credentials: authCredentials{
+				query: ctx.Request.URL.RawQuery,
+				ip:    net.ParseIP(ip),
+				user:  user,
+				pass:  pass,
+				proto: authProtocolWebRTC,
+			},
+		})
+		if res.err != nil {
+			if terr, ok := res.err.(*errAuthentication); ok {
+				if !hasCredentials {
+					ctx.Header("WWW-Authenticate", `Basic realm="mediamtx"`)
+					ctx.Writer.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+
+				s.Log(logger.Info, "connection %v failed to authenticate: %v", remoteAddr, terr.message)
+
+				// wait some seconds to stop brute force attacks
+				<-time.After(webrtcPauseAfterAuthError)
+
 				ctx.Writer.WriteHeader(http.StatusUnauthorized)
 				return
 			}
 
-			s.Log(logger.Info, "authentication error: %v", terr.wrapped)
-			ctx.Writer.WriteHeader(http.StatusUnauthorized)
+			ctx.Writer.WriteHeader(http.StatusNotFound)
 			return
 		}
-
-		ctx.Writer.WriteHeader(http.StatusNotFound)
-		return
 	}
 
 	switch fname {
 	case "":
+		ctx.Writer.Header().Set("Cache-Control", "max-age=3600")
 		ctx.Writer.Header().Set("Content-Type", "text/html")
 		ctx.Writer.WriteHeader(http.StatusOK)
 		ctx.Writer.Write(webrtcReadIndex)
 
 	case "publish":
+		ctx.Writer.Header().Set("Cache-Control", "max-age=3600")
 		ctx.Writer.Header().Set("Content-Type", "text/html")
 		ctx.Writer.WriteHeader(http.StatusOK)
 		ctx.Writer.Write(webrtcPublishIndex)
@@ -289,10 +219,16 @@ func (s *webRTCHTTPServer) onRequest(ctx *gin.Context) {
 	case "whip", "whep":
 		switch ctx.Request.Method {
 		case http.MethodOptions:
-			ctx.Writer.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-			ctx.Writer.Header().Set("Access-Control-Allow-Headers", ctx.Request.Header.Get("Access-Control-Request-Headers"))
-			ctx.Writer.Header()["Link"] = iceServersToLinkHeader(s.parent.genICEServers())
-			ctx.Writer.WriteHeader(http.StatusOK)
+			servers, err := s.parent.generateICEServers()
+			if err != nil {
+				ctx.Writer.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			ctx.Writer.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PATCH")
+			ctx.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match")
+			ctx.Writer.Header()["Link"] = whip.LinkHeaderMarshal(servers)
+			ctx.Writer.WriteHeader(http.StatusNoContent)
 
 		case http.MethodPost:
 			if ctx.Request.Header.Get("Content-Type") != "application/sdp" {
@@ -305,26 +241,33 @@ func (s *webRTCHTTPServer) onRequest(ctx *gin.Context) {
 				return
 			}
 
-			res := s.parent.sessionNew(webRTCSessionNewReq{
-				pathName:     dir,
-				remoteAddr:   ctx.ClientIP(),
-				offer:        offer,
-				publish:      (fname == "whip"),
-				videoCodec:   ctx.Query("video_codec"),
-				audioCodec:   ctx.Query("audio_codec"),
-				videoBitrate: ctx.Query("video_bitrate"),
+			res := s.parent.newSession(webRTCNewSessionReq{
+				pathName:   dir,
+				remoteAddr: remoteAddr,
+				query:      ctx.Request.URL.RawQuery,
+				user:       user,
+				pass:       pass,
+				offer:      offer,
+				publish:    (fname == "whip"),
 			})
 			if res.err != nil {
-				if res.errStatusCode != 0 {
-					ctx.Writer.WriteHeader(res.errStatusCode)
-				}
+				ctx.Writer.WriteHeader(res.errStatusCode)
+				return
+			}
+
+			servers, err := s.parent.generateICEServers()
+			if err != nil {
+				ctx.Writer.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 
 			ctx.Writer.Header().Set("Content-Type", "application/sdp")
+			ctx.Writer.Header().Set("Access-Control-Expose-Headers", "E-Tag, Accept-Patch, Link")
 			ctx.Writer.Header().Set("E-Tag", res.sx.secret.String())
+			ctx.Writer.Header().Set("ID", res.sx.uuid.String())
 			ctx.Writer.Header().Set("Accept-Patch", "application/trickle-ice-sdpfrag")
-			ctx.Writer.Header()["Link"] = iceServersToLinkHeader(s.parent.genICEServers())
+			ctx.Writer.Header()["Link"] = whip.LinkHeaderMarshal(servers)
+			ctx.Writer.Header().Set("Location", ctx.Request.URL.String())
 			ctx.Writer.WriteHeader(http.StatusCreated)
 			ctx.Writer.Write(res.answer)
 
@@ -345,13 +288,13 @@ func (s *webRTCHTTPServer) onRequest(ctx *gin.Context) {
 				return
 			}
 
-			candidates, err := unmarshalICEFragment(byts)
+			candidates, err := whip.ICEFragmentUnmarshal(byts)
 			if err != nil {
 				ctx.Writer.WriteHeader(http.StatusBadRequest)
 				return
 			}
 
-			res := s.parent.sessionAddCandidates(webRTCSessionAddCandidatesReq{
+			res := s.parent.addSessionCandidates(webRTCAddSessionCandidatesReq{
 				secret:     secret,
 				candidates: candidates,
 			})

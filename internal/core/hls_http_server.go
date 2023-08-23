@@ -1,10 +1,8 @@
 package core
 
 import (
-	"context"
-	"crypto/tls"
 	_ "embed"
-	"log"
+	"fmt"
 	"net"
 	"net/http"
 	gopath "path"
@@ -14,11 +12,19 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/httpserv"
 	"github.com/bluenviron/mediamtx/internal/logger"
+)
+
+const (
+	hlsPauseAfterAuthError = 2 * time.Second
 )
 
 //go:embed hls_index.html
 var hlsIndex []byte
+
+//go:embed hls.min.js
+var hlsMinJS []byte
 
 type hlsHTTPServerParent interface {
 	logger.Writer
@@ -30,8 +36,7 @@ type hlsHTTPServer struct {
 	pathManager *pathManager
 	parent      hlsHTTPServerParent
 
-	ln    net.Listener
-	inner *http.Server
+	inner *httpserv.WrappedServer
 }
 
 func newHLSHTTPServer( //nolint:dupl
@@ -45,47 +50,40 @@ func newHLSHTTPServer( //nolint:dupl
 	pathManager *pathManager,
 	parent hlsHTTPServerParent,
 ) (*hlsHTTPServer, error) {
-	ln, err := net.Listen(restrictNetwork("tcp", address))
-	if err != nil {
-		return nil, err
-	}
-
-	var tlsConfig *tls.Config
 	if encryption {
-		crt, err := tls.LoadX509KeyPair(serverCert, serverKey)
-		if err != nil {
-			ln.Close()
-			return nil, err
+		if serverCert == "" {
+			return nil, fmt.Errorf("server cert is missing")
 		}
-
-		tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{crt},
-		}
+	} else {
+		serverKey = ""
+		serverCert = ""
 	}
 
 	s := &hlsHTTPServer{
 		allowOrigin: allowOrigin,
 		pathManager: pathManager,
 		parent:      parent,
-		ln:          ln,
 	}
 
 	router := gin.New()
-	httpSetTrustedProxies(router, trustedProxies)
+	router.SetTrustedProxies(trustedProxies.ToTrustedProxies()) //nolint:errcheck
 
-	router.NoRoute(httpLoggerMiddleware(s), httpServerHeaderMiddleware, s.onRequest)
+	router.NoRoute(s.onRequest)
 
-	s.inner = &http.Server{
-		Handler:           router,
-		TLSConfig:         tlsConfig,
-		ReadHeaderTimeout: time.Duration(readTimeout),
-		ErrorLog:          log.New(&nilWriter{}, "", 0),
-	}
+	network, address := restrictNetwork("tcp", address)
 
-	if tlsConfig != nil {
-		go s.inner.ServeTLS(s.ln, "", "")
-	} else {
-		go s.inner.Serve(s.ln)
+	var err error
+	s.inner, err = httpserv.NewWrappedServer(
+		network,
+		address,
+		time.Duration(readTimeout),
+		serverCert,
+		serverKey,
+		router,
+		s,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	return s, nil
@@ -96,8 +94,7 @@ func (s *hlsHTTPServer) Log(level logger.Level, format string, args ...interface
 }
 
 func (s *hlsHTTPServer) close() {
-	s.inner.Shutdown(context.Background())
-	s.ln.Close() // in case Shutdown() is called before Serve()
+	s.inner.Close()
 }
 
 func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
@@ -105,13 +102,13 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 	ctx.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 
 	switch ctx.Request.Method {
-	case http.MethodGet:
-
 	case http.MethodOptions:
-		ctx.Writer.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		ctx.Writer.Header().Set("Access-Control-Allow-Headers", ctx.Request.Header.Get("Access-Control-Request-Headers"))
-		ctx.Writer.WriteHeader(http.StatusOK)
+		ctx.Writer.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET")
+		ctx.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Range")
+		ctx.Writer.WriteHeader(http.StatusNoContent)
 		return
+
+	case http.MethodGet:
 
 	default:
 		return
@@ -124,6 +121,13 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 	var fname string
 
 	switch {
+	case strings.HasSuffix(pa, "/hls.min.js"):
+		ctx.Writer.Header().Set("Cache-Control", "max-age=3600")
+		ctx.Writer.Header().Set("Content-Type", "application/javascript")
+		ctx.Writer.WriteHeader(http.StatusOK)
+		ctx.Writer.Write(hlsMinJS)
+		return
+
 	case pa == "", pa == "favicon.ico":
 		return
 
@@ -141,7 +145,11 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 		dir, fname = pa, ""
 
 		if !strings.HasSuffix(dir, "/") {
-			ctx.Writer.Header().Set("Location", "/"+dir+"/")
+			l := "/" + dir + "/"
+			if ctx.Request.URL.RawQuery != "" {
+				l += "?" + ctx.Request.URL.RawQuery
+			}
+			ctx.Writer.Header().Set("Location", l)
 			ctx.Writer.WriteHeader(http.StatusMovedPermanently)
 			return
 		}
@@ -154,7 +162,7 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 
 	user, pass, hasCredentials := ctx.Request.BasicAuth()
 
-	res := s.pathManager.getPathConf(pathGetPathConfReq{
+	res := s.pathManager.getConfForPath(pathGetConfForPathReq{
 		name:    dir,
 		publish: false,
 		credentials: authCredentials{
@@ -162,18 +170,26 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 			ip:    net.ParseIP(ctx.ClientIP()),
 			user:  user,
 			pass:  pass,
-			proto: authProtocolWebRTC,
+			proto: authProtocolHLS,
 		},
 	})
 	if res.err != nil {
-		if terr, ok := res.err.(pathErrAuth); ok {
+		if terr, ok := res.err.(*errAuthentication); ok {
 			if !hasCredentials {
 				ctx.Header("WWW-Authenticate", `Basic realm="mediamtx"`)
 				ctx.Writer.WriteHeader(http.StatusUnauthorized)
 				return
 			}
 
-			s.Log(logger.Info, "authentication error: %v", terr.wrapped)
+			ip := ctx.ClientIP()
+			_, port, _ := net.SplitHostPort(ctx.Request.RemoteAddr)
+			remoteAddr := net.JoinHostPort(ip, port)
+
+			s.Log(logger.Info, "connection %v failed to authenticate: %v", remoteAddr, terr.message)
+
+			// wait some seconds to stop brute force attacks
+			<-time.After(hlsPauseAfterAuthError)
+
 			ctx.Writer.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -184,6 +200,7 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 
 	switch fname {
 	case "":
+		ctx.Writer.Header().Set("Cache-Control", "max-age=3600")
 		ctx.Writer.Header().Set("Content-Type", "text/html")
 		ctx.Writer.WriteHeader(http.StatusOK)
 		ctx.Writer.Write(hlsIndex)

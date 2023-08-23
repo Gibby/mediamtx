@@ -11,6 +11,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/formatprocessor"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/rpicamera"
+	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
 func paramsFromConf(cnf *conf.PathConf) rpicamera.Params {
@@ -32,6 +33,7 @@ func paramsFromConf(cnf *conf.PathConf) rpicamera.Params {
 		Gain:              cnf.RPICameraGain,
 		EV:                cnf.RPICameraEV,
 		ROI:               cnf.RPICameraROI,
+		HDR:               cnf.RPICameraHDR,
 		TuningFile:        cnf.RPICameraTuningFile,
 		Mode:              cnf.RPICameraMode,
 		FPS:               cnf.RPICameraFPS,
@@ -51,8 +53,8 @@ func paramsFromConf(cnf *conf.PathConf) rpicamera.Params {
 
 type rpiCameraSourceParent interface {
 	logger.Writer
-	sourceStaticImplSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
-	sourceStaticImplSetNotReady(req pathSourceStaticSetNotReadyReq)
+	setReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
+	setNotReady(req pathSourceStaticSetNotReadyReq)
 }
 
 type rpiCameraSource struct {
@@ -68,7 +70,7 @@ func newRPICameraSource(
 }
 
 func (s *rpiCameraSource) Log(level logger.Level, format string, args ...interface{}) {
-	s.parent.Log(level, "[rpicamera source] "+format, args...)
+	s.parent.Log(level, "[RPI Camera source] "+format, args...)
 }
 
 // run implements sourceStaticImpl.
@@ -81,11 +83,11 @@ func (s *rpiCameraSource) run(ctx context.Context, cnf *conf.PathConf, reloadCon
 		}},
 	}
 	medias := media.Medias{medi}
-	var stream *stream
+	var stream *stream.Stream
 
 	onData := func(dts time.Duration, au [][]byte) {
 		if stream == nil {
-			res := s.parent.sourceStaticImplSetReady(pathSourceStaticSetReadyReq{
+			res := s.parent.setReady(pathSourceStaticSetReadyReq{
 				medias:             medias,
 				generateRTPPackets: true,
 			})
@@ -93,14 +95,15 @@ func (s *rpiCameraSource) run(ctx context.Context, cnf *conf.PathConf, reloadCon
 				return
 			}
 
-			s.Log(logger.Info, "ready: %s", sourceMediaInfo(medias))
 			stream = res.stream
 		}
 
-		stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitH264{
+		stream.WriteUnit(medi, medi.Formats[0], &formatprocessor.UnitH264{
+			BaseUnit: formatprocessor.BaseUnit{
+				NTP: time.Now(),
+			},
 			PTS: dts,
 			AU:  au,
-			NTP: time.Now(),
 		})
 	}
 
@@ -112,7 +115,7 @@ func (s *rpiCameraSource) run(ctx context.Context, cnf *conf.PathConf, reloadCon
 
 	defer func() {
 		if stream != nil {
-			s.parent.sourceStaticImplSetNotReady(pathSourceStaticSetNotReadyReq{})
+			s.parent.setNotReady(pathSourceStaticSetNotReadyReq{})
 		}
 	}()
 

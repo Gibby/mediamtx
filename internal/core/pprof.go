@@ -1,9 +1,6 @@
 package core
 
 import (
-	"context"
-	"log"
-	"net"
 	"net/http"
 	"time"
 
@@ -11,6 +8,7 @@ import (
 	_ "net/http/pprof"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/httpserv"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
@@ -21,8 +19,7 @@ type pprofParent interface {
 type pprof struct {
 	parent pprofParent
 
-	ln         net.Listener
-	httpServer *http.Server
+	httpServer *httpserv.WrappedServer
 }
 
 func newPPROF(
@@ -30,33 +27,34 @@ func newPPROF(
 	readTimeout conf.StringDuration,
 	parent pprofParent,
 ) (*pprof, error) {
-	ln, err := net.Listen(restrictNetwork("tcp", address))
+	pp := &pprof{
+		parent: parent,
+	}
+
+	network, address := restrictNetwork("tcp", address)
+
+	var err error
+	pp.httpServer, err = httpserv.NewWrappedServer(
+		network,
+		address,
+		time.Duration(readTimeout),
+		"",
+		"",
+		http.DefaultServeMux,
+		pp,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	pp := &pprof{
-		parent: parent,
-		ln:     ln,
-	}
-
-	pp.httpServer = &http.Server{
-		Handler:           http.DefaultServeMux,
-		ReadHeaderTimeout: time.Duration(readTimeout),
-		ErrorLog:          log.New(&nilWriter{}, "", 0),
-	}
-
 	pp.Log(logger.Info, "listener opened on "+address)
-
-	go pp.httpServer.Serve(pp.ln)
 
 	return pp, nil
 }
 
 func (pp *pprof) close() {
 	pp.Log(logger.Info, "listener is closing")
-	pp.httpServer.Shutdown(context.Background())
-	pp.ln.Close() // in case Shutdown() is called before Serve()
+	pp.httpServer.Close()
 }
 
 func (pp *pprof) Log(level logger.Level, format string, args ...interface{}) {

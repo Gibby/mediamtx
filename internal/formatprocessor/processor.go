@@ -10,16 +10,12 @@ import (
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
-const (
-	maxKeyFrameInterval = 10 * time.Second
-)
-
 // Processor cleans and normalizes streams.
 type Processor interface {
 	// cleans and normalizes a data unit.
 	Process(Unit, bool) error
 
-	// returns an unit for the given RTP packet.
+	// wraps a RTP packet into a Unit.
 	UnitForRTPPacket(pkt *rtp.Packet, ntp time.Time) Unit
 }
 
@@ -46,11 +42,14 @@ func New(
 	case *formats.AV1:
 		return newAV1(udpMaxPayloadSize, forma, generateRTPPackets, log)
 
-	case *formats.MPEG2Audio:
-		return newMPEG2Audio(udpMaxPayloadSize, forma, generateRTPPackets, log)
+	case *formats.MPEG1Audio:
+		return newMPEG1Audio(udpMaxPayloadSize, forma, generateRTPPackets, log)
 
-	case *formats.MPEG4Audio:
-		return newMPEG4Audio(udpMaxPayloadSize, forma, generateRTPPackets, log)
+	case *formats.MPEG4AudioGeneric:
+		return newMPEG4AudioGeneric(udpMaxPayloadSize, forma, generateRTPPackets, log)
+
+	case *formats.MPEG4AudioLATM:
+		return newMPEG4AudioLATM(udpMaxPayloadSize, forma, generateRTPPackets, log)
 
 	case *formats.Opus:
 		return newOpus(udpMaxPayloadSize, forma, generateRTPPackets, log)

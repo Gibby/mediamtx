@@ -19,12 +19,19 @@ func TestH264DynamicParams(t *testing.T) {
 	p, err := New(1472, forma, false, nil)
 	require.NoError(t, err)
 
-	enc := forma.CreateEncoder()
+	enc, err := forma.CreateEncoder2()
+	require.NoError(t, err)
 
 	pkts, err := enc.Encode([][]byte{{byte(h264.NALUTypeIDR)}}, 0)
 	require.NoError(t, err)
-	data := &UnitH264{RTPPackets: []*rtp.Packet{pkts[0]}}
-	p.Process(data, true)
+
+	data := &UnitH264{
+		BaseUnit: BaseUnit{
+			RTPPackets: []*rtp.Packet{pkts[0]},
+		},
+	}
+	err = p.Process(data, true)
+	require.NoError(t, err)
 
 	require.Equal(t, [][]byte{
 		{byte(h264.NALUTypeIDR)},
@@ -32,19 +39,37 @@ func TestH264DynamicParams(t *testing.T) {
 
 	pkts, err = enc.Encode([][]byte{{7, 4, 5, 6}}, 0) // SPS
 	require.NoError(t, err)
-	p.Process(&UnitH264{RTPPackets: []*rtp.Packet{pkts[0]}}, false)
+
+	err = p.Process(&UnitH264{
+		BaseUnit: BaseUnit{
+			RTPPackets: []*rtp.Packet{pkts[0]},
+		},
+	}, false)
+	require.NoError(t, err)
 
 	pkts, err = enc.Encode([][]byte{{8, 1}}, 0) // PPS
 	require.NoError(t, err)
-	p.Process(&UnitH264{RTPPackets: []*rtp.Packet{pkts[0]}}, false)
+
+	err = p.Process(&UnitH264{
+		BaseUnit: BaseUnit{
+			RTPPackets: []*rtp.Packet{pkts[0]},
+		},
+	}, false)
+	require.NoError(t, err)
 
 	require.Equal(t, []byte{7, 4, 5, 6}, forma.SPS)
 	require.Equal(t, []byte{8, 1}, forma.PPS)
 
 	pkts, err = enc.Encode([][]byte{{byte(h264.NALUTypeIDR)}}, 0)
 	require.NoError(t, err)
-	data = &UnitH264{RTPPackets: []*rtp.Packet{pkts[0]}}
-	p.Process(data, true)
+
+	data = &UnitH264{
+		BaseUnit: BaseUnit{
+			RTPPackets: []*rtp.Packet{pkts[0]},
+		},
+	}
+	err = p.Process(data, true)
+	require.NoError(t, err)
 
 	require.Equal(t, [][]byte{
 		{0x07, 4, 5, 6},
@@ -104,8 +129,14 @@ func TestH264OversizedPackets(t *testing.T) {
 			Payload: []byte{0x1c, 0b01000000, 0x01, 0x02, 0x03, 0x04},
 		},
 	} {
-		data := &UnitH264{RTPPackets: []*rtp.Packet{pkt}}
-		p.Process(data, false)
+		data := &UnitH264{
+			BaseUnit: BaseUnit{
+				RTPPackets: []*rtp.Packet{pkt},
+			},
+		}
+		err := p.Process(data, false)
+		require.NoError(t, err)
+
 		out = append(out, data.RTPPackets...)
 	}
 
@@ -168,7 +199,8 @@ func TestH264EmptyPacket(t *testing.T) {
 		},
 	}
 
-	p.Process(unit, false)
+	err = p.Process(unit, false)
+	require.NoError(t, err)
 
 	// if all NALUs have been removed, no RTP packets must be generated.
 	require.Equal(t, []*rtp.Packet(nil), unit.RTPPackets)

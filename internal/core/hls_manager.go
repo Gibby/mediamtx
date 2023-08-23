@@ -3,44 +3,30 @@ package core
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
-	"time"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
-type nilWriter struct{}
-
-func (nilWriter) Write(p []byte) (int, error) {
-	return len(p), nil
-}
-
-type hlsManagerAPIMuxersListItem struct {
-	Path        string    `json:"path"`
-	Created     time.Time `json:"created"`
-	LastRequest time.Time `json:"lastRequest"`
-	BytesSent   uint64    `json:"bytesSent"`
-}
-
-type hlsManagerAPIMuxersListData struct {
-	PageCount int                           `json:"pageCount"`
-	Items     []hlsManagerAPIMuxersListItem `json:"items"`
-}
-
 type hlsManagerAPIMuxersListRes struct {
-	data   *hlsManagerAPIMuxersListData
-	muxers map[string]*hlsMuxer
-	err    error
+	data *apiHLSMuxersList
+	err  error
 }
 
 type hlsManagerAPIMuxersListReq struct {
 	res chan hlsManagerAPIMuxersListRes
 }
 
-type hlsManagerAPIMuxersListSubReq struct {
-	data *hlsManagerAPIMuxersListData
-	res  chan struct{}
+type hlsManagerAPIMuxersGetRes struct {
+	data *apiHLSMuxer
+	err  error
+}
+
+type hlsManagerAPIMuxersGetReq struct {
+	name string
+	res  chan hlsManagerAPIMuxersGetRes
 }
 
 type hlsManagerParent interface {
@@ -68,15 +54,15 @@ type hlsManager struct {
 	muxers     map[string]*hlsMuxer
 
 	// in
-	chPathSourceReady    chan *path
-	chPathSourceNotReady chan *path
-	chHandleRequest      chan hlsMuxerHandleRequestReq
-	chMuxerClose         chan *hlsMuxer
-	chAPIMuxerList       chan hlsManagerAPIMuxersListReq
+	chPathReady     chan *path
+	chPathNotReady  chan *path
+	chHandleRequest chan hlsMuxerHandleRequestReq
+	chCloseMuxer    chan *hlsMuxer
+	chAPIMuxerList  chan hlsManagerAPIMuxersListReq
+	chAPIMuxerGet   chan hlsManagerAPIMuxersGetReq
 }
 
 func newHLSManager(
-	parentCtx context.Context,
 	address string,
 	encryption bool,
 	serverKey string,
@@ -97,7 +83,7 @@ func newHLSManager(
 	metrics *metrics,
 	parent hlsManagerParent,
 ) (*hlsManager, error) {
-	ctx, ctxCancel := context.WithCancel(parentCtx)
+	ctx, ctxCancel := context.WithCancel(context.Background())
 
 	m := &hlsManager{
 		externalAuthenticationURL: externalAuthenticationURL,
@@ -115,11 +101,12 @@ func newHLSManager(
 		ctx:                       ctx,
 		ctxCancel:                 ctxCancel,
 		muxers:                    make(map[string]*hlsMuxer),
-		chPathSourceReady:         make(chan *path),
-		chPathSourceNotReady:      make(chan *path),
+		chPathReady:               make(chan *path),
+		chPathNotReady:            make(chan *path),
 		chHandleRequest:           make(chan hlsMuxerHandleRequestReq),
-		chMuxerClose:              make(chan *hlsMuxer),
+		chCloseMuxer:              make(chan *hlsMuxer),
 		chAPIMuxerList:            make(chan hlsManagerAPIMuxersListReq),
+		chAPIMuxerGet:             make(chan hlsManagerAPIMuxersGetReq),
 	}
 
 	var err error
@@ -141,10 +128,10 @@ func newHLSManager(
 
 	m.Log(logger.Info, "listener opened on "+address)
 
-	m.pathManager.hlsManagerSet(m)
+	m.pathManager.setHLSManager(m)
 
 	if m.metrics != nil {
-		m.metrics.hlsManagerSet(m)
+		m.metrics.setHLSManager(m)
 	}
 
 	m.wg.Add(1)
@@ -170,18 +157,18 @@ func (m *hlsManager) run() {
 outer:
 	for {
 		select {
-		case pa := <-m.chPathSourceReady:
-			if m.alwaysRemux {
-				m.createMuxer(pa.name, "")
+		case pa := <-m.chPathReady:
+			if m.alwaysRemux && !pa.conf.SourceOnDemand {
+				if _, ok := m.muxers[pa.name]; !ok {
+					m.createMuxer(pa.name, "")
+				}
 			}
 
-		case pa := <-m.chPathSourceNotReady:
-			if m.alwaysRemux {
-				c, ok := m.muxers[pa.name]
-				if ok {
-					c.close()
-					delete(m.muxers, pa.name)
-				}
+		case pa := <-m.chPathNotReady:
+			c, ok := m.muxers[pa.name]
+			if ok && c.remoteAddr == "" { // created with "always remux"
+				c.close()
+				delete(m.muxers, pa.name)
 			}
 
 		case req := <-m.chHandleRequest:
@@ -190,30 +177,42 @@ outer:
 			case ok:
 				r.processRequest(&req)
 
-			case m.alwaysRemux:
-				req.res <- nil
-
 			default:
 				r := m.createMuxer(req.path, req.ctx.ClientIP())
 				r.processRequest(&req)
 			}
 
-		case c := <-m.chMuxerClose:
+		case c := <-m.chCloseMuxer:
 			if c2, ok := m.muxers[c.PathName()]; !ok || c2 != c {
 				continue
 			}
 			delete(m.muxers, c.PathName())
 
 		case req := <-m.chAPIMuxerList:
-			muxers := make(map[string]*hlsMuxer)
-
-			for name, m := range m.muxers {
-				muxers[name] = m
+			data := &apiHLSMuxersList{
+				Items: []*apiHLSMuxer{},
 			}
+
+			for _, muxer := range m.muxers {
+				data.Items = append(data.Items, muxer.apiItem())
+			}
+
+			sort.Slice(data.Items, func(i, j int) bool {
+				return data.Items[i].Created.Before(data.Items[j].Created)
+			})
 
 			req.res <- hlsManagerAPIMuxersListRes{
-				muxers: muxers,
+				data: data,
 			}
+
+		case req := <-m.chAPIMuxerGet:
+			muxer, ok := m.muxers[req.name]
+			if !ok {
+				req.res <- hlsManagerAPIMuxersGetRes{err: errAPINotFound}
+				continue
+			}
+
+			req.res <- hlsManagerAPIMuxersGetRes{data: muxer.apiItem()}
 
 		case <-m.ctx.Done():
 			break outer
@@ -224,10 +223,10 @@ outer:
 
 	m.httpServer.close()
 
-	m.pathManager.hlsManagerSet(nil)
+	m.pathManager.setHLSManager(nil)
 
 	if m.metrics != nil {
-		m.metrics.hlsManagerSet(nil)
+		m.metrics.setHLSManager(nil)
 	}
 }
 
@@ -236,7 +235,6 @@ func (m *hlsManager) createMuxer(pathName string, remoteAddr string) *hlsMuxer {
 		m.ctx,
 		remoteAddr,
 		m.externalAuthenticationURL,
-		m.alwaysRemux,
 		m.variant,
 		m.segmentCount,
 		m.segmentDuration,
@@ -252,32 +250,32 @@ func (m *hlsManager) createMuxer(pathName string, remoteAddr string) *hlsMuxer {
 	return r
 }
 
-// muxerClose is called by hlsMuxer.
-func (m *hlsManager) muxerClose(c *hlsMuxer) {
+// closeMuxer is called by hlsMuxer.
+func (m *hlsManager) closeMuxer(c *hlsMuxer) {
 	select {
-	case m.chMuxerClose <- c:
+	case m.chCloseMuxer <- c:
 	case <-m.ctx.Done():
 	}
 }
 
-// pathSourceReady is called by pathManager.
-func (m *hlsManager) pathSourceReady(pa *path) {
+// pathReady is called by pathManager.
+func (m *hlsManager) pathReady(pa *path) {
 	select {
-	case m.chPathSourceReady <- pa:
+	case m.chPathReady <- pa:
 	case <-m.ctx.Done():
 	}
 }
 
-// pathSourceNotReady is called by pathManager.
-func (m *hlsManager) pathSourceNotReady(pa *path) {
+// pathNotReady is called by pathManager.
+func (m *hlsManager) pathNotReady(pa *path) {
 	select {
-	case m.chPathSourceNotReady <- pa:
+	case m.chPathNotReady <- pa:
 	case <-m.ctx.Done():
 	}
 }
 
 // apiMuxersList is called by api.
-func (m *hlsManager) apiMuxersList() hlsManagerAPIMuxersListRes {
+func (m *hlsManager) apiMuxersList() (*apiHLSMuxersList, error) {
 	req := hlsManagerAPIMuxersListReq{
 		res: make(chan hlsManagerAPIMuxersListRes),
 	}
@@ -285,19 +283,27 @@ func (m *hlsManager) apiMuxersList() hlsManagerAPIMuxersListRes {
 	select {
 	case m.chAPIMuxerList <- req:
 		res := <-req.res
-
-		res.data = &hlsManagerAPIMuxersListData{
-			Items: []hlsManagerAPIMuxersListItem{},
-		}
-
-		for _, pa := range res.muxers {
-			pa.apiMuxersList(hlsManagerAPIMuxersListSubReq{data: res.data})
-		}
-
-		return res
+		return res.data, res.err
 
 	case <-m.ctx.Done():
-		return hlsManagerAPIMuxersListRes{err: fmt.Errorf("terminated")}
+		return nil, fmt.Errorf("terminated")
+	}
+}
+
+// apiMuxersGet is called by api.
+func (m *hlsManager) apiMuxersGet(name string) (*apiHLSMuxer, error) {
+	req := hlsManagerAPIMuxersGetReq{
+		name: name,
+		res:  make(chan hlsManagerAPIMuxersGetRes),
+	}
+
+	select {
+	case m.chAPIMuxerGet <- req:
+		res := <-req.res
+		return res.data, res.err
+
+	case <-m.ctx.Done():
+		return nil, fmt.Errorf("terminated")
 	}
 }
 

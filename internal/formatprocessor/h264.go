@@ -71,20 +71,9 @@ func rtpH264ExtractSPSPPS(pkt *rtp.Packet) ([]byte, []byte) {
 
 // UnitH264 is a H264 data unit.
 type UnitH264 struct {
-	RTPPackets []*rtp.Packet
-	NTP        time.Time
-	PTS        time.Duration
-	AU         [][]byte
-}
-
-// GetRTPPackets implements Unit.
-func (d *UnitH264) GetRTPPackets() []*rtp.Packet {
-	return d.RTPPackets
-}
-
-// GetNTP implements Unit.
-func (d *UnitH264) GetNTP() time.Time {
-	return d.NTP
+	BaseUnit
+	PTS time.Duration
+	AU  [][]byte
 }
 
 type formatProcessorH264 struct {
@@ -92,9 +81,8 @@ type formatProcessorH264 struct {
 	format            *formats.H264
 	log               logger.Writer
 
-	encoder              *rtph264.Encoder
-	decoder              *rtph264.Decoder
-	lastKeyFrameReceived time.Time
+	encoder *rtph264.Encoder
+	decoder *rtph264.Decoder
 }
 
 func newH264(
@@ -110,16 +98,27 @@ func newH264(
 	}
 
 	if generateRTPPackets {
-		t.encoder = &rtph264.Encoder{
-			PayloadMaxSize:    udpMaxPayloadSize - 12,
-			PayloadType:       forma.PayloadTyp,
-			PacketizationMode: forma.PacketizationMode,
+		err := t.createEncoder(nil, nil, nil)
+		if err != nil {
+			return nil, err
 		}
-		t.encoder.Init()
-		t.lastKeyFrameReceived = time.Now()
 	}
 
 	return t, nil
+}
+
+func (t *formatProcessorH264) createEncoder(
+	ssrc *uint32, initialSequenceNumber *uint16, initialTimestamp *uint32,
+) error {
+	t.encoder = &rtph264.Encoder{
+		PayloadMaxSize:        t.udpMaxPayloadSize - 12,
+		PayloadType:           t.format.PayloadTyp,
+		SSRC:                  ssrc,
+		InitialSequenceNumber: initialSequenceNumber,
+		InitialTimestamp:      initialTimestamp,
+		PacketizationMode:     t.format.PacketizationMode,
+	}
+	return t.encoder.Init()
 }
 
 func (t *formatProcessorH264) updateTrackParametersFromRTPPacket(pkt *rtp.Packet) {
@@ -145,12 +144,12 @@ func (t *formatProcessorH264) updateTrackParametersFromRTPPacket(pkt *rtp.Packet
 	}
 }
 
-func (t *formatProcessorH264) updateTrackParametersFromNALUs(nalus [][]byte) {
+func (t *formatProcessorH264) updateTrackParametersFromAU(au [][]byte) {
 	sps := t.format.SPS
 	pps := t.format.PPS
 	update := false
 
-	for _, nalu := range nalus {
+	for _, nalu := range au {
 		typ := h264.NALUType(nalu[0] & 0x1F)
 
 		switch typ {
@@ -173,23 +172,11 @@ func (t *formatProcessorH264) updateTrackParametersFromNALUs(nalus [][]byte) {
 	}
 }
 
-func (t *formatProcessorH264) checkKeyFrameInterval(isKeyFrame bool) {
-	if isKeyFrame {
-		t.lastKeyFrameReceived = time.Now()
-	} else {
-		now := time.Now()
-		if now.Sub(t.lastKeyFrameReceived) >= maxKeyFrameInterval {
-			t.lastKeyFrameReceived = now
-			t.log.Log(logger.Warn, "no H264 key frames received in %v, stream can't be decoded")
-		}
-	}
-}
-
-func (t *formatProcessorH264) remuxAccessUnit(nalus [][]byte) [][]byte {
+func (t *formatProcessorH264) remuxAccessUnit(au [][]byte) [][]byte {
 	isKeyFrame := false
 	n := 0
 
-	for _, nalu := range nalus {
+	for _, nalu := range au {
 		typ := h264.NALUType(nalu[0] & 0x1F)
 
 		switch typ {
@@ -212,8 +199,6 @@ func (t *formatProcessorH264) remuxAccessUnit(nalus [][]byte) [][]byte {
 		n++
 	}
 
-	t.checkKeyFrameInterval(isKeyFrame)
-
 	if n == 0 {
 		return nil
 	}
@@ -227,7 +212,7 @@ func (t *formatProcessorH264) remuxAccessUnit(nalus [][]byte) [][]byte {
 		i = 2
 	}
 
-	for _, nalu := range nalus {
+	for _, nalu := range au {
 		typ := h264.NALUType(nalu[0] & 0x1F)
 
 		switch typ {
@@ -262,23 +247,21 @@ func (t *formatProcessorH264) Process(unit Unit, hasNonRTSPReaders bool) error {
 				v1 := pkt.SSRC
 				v2 := pkt.SequenceNumber
 				v3 := pkt.Timestamp
-				t.encoder = &rtph264.Encoder{
-					PayloadMaxSize:        t.udpMaxPayloadSize - 12,
-					PayloadType:           pkt.PayloadType,
-					SSRC:                  &v1,
-					InitialSequenceNumber: &v2,
-					InitialTimestamp:      &v3,
-					PacketizationMode:     t.format.PacketizationMode,
+				err := t.createEncoder(&v1, &v2, &v3)
+				if err != nil {
+					return err
 				}
-				t.encoder.Init()
 			}
 		}
 
 		// decode from RTP
 		if hasNonRTSPReaders || t.decoder != nil || t.encoder != nil {
 			if t.decoder == nil {
-				t.decoder = t.format.CreateDecoder()
-				t.lastKeyFrameReceived = time.Now()
+				var err error
+				t.decoder, err = t.format.CreateDecoder2()
+				if err != nil {
+					return err
+				}
 			}
 
 			if t.encoder != nil {
@@ -303,7 +286,7 @@ func (t *formatProcessorH264) Process(unit Unit, hasNonRTSPReaders bool) error {
 			return nil
 		}
 	} else {
-		t.updateTrackParametersFromNALUs(tunit.AU)
+		t.updateTrackParametersFromAU(tunit.AU)
 		tunit.AU = t.remuxAccessUnit(tunit.AU)
 	}
 
@@ -323,7 +306,9 @@ func (t *formatProcessorH264) Process(unit Unit, hasNonRTSPReaders bool) error {
 
 func (t *formatProcessorH264) UnitForRTPPacket(pkt *rtp.Packet, ntp time.Time) Unit {
 	return &UnitH264{
-		RTPPackets: []*rtp.Packet{pkt},
-		NTP:        ntp,
+		BaseUnit: BaseUnit{
+			RTPPackets: []*rtp.Packet{pkt},
+			NTP:        ntp,
+		},
 	}
 }

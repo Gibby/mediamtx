@@ -25,9 +25,10 @@ typedef struct {
     float gain;
     float ev;
     window_t *roi;
+    bool hdr;
     char *tuning_file;
     sensor_mode_t *mode;
-    unsigned int fps;
+    float fps;
     unsigned int idr_period;
     unsigned int bitrate;
     unsigned int profile;

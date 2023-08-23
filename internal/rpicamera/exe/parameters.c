@@ -81,6 +81,8 @@ bool parameters_unserialize(parameters_t *params, const uint8_t *buf, size_t buf
                 }
             }
             free(decoded_val);
+        } else if (strcmp(key, "HDR") == 0) {
+            params->hdr = (strcmp(val, "1") == 0);
         } else if (strcmp(key, "TuningFile") == 0) {
             params->tuning_file = base64_decode(val);
         } else if (strcmp(key, "Mode") == 0) {
@@ -96,7 +98,7 @@ bool parameters_unserialize(parameters_t *params, const uint8_t *buf, size_t buf
             }
             free(decoded_val);
         } else if (strcmp(key, "FPS") == 0) {
-            params->fps = atoi(val);
+            params->fps = atof(val);
         } else if (strcmp(key, "IDRPeriod") == 0) {
             params->idr_period = atoi(val);
         } else if (strcmp(key, "Bitrate") == 0) {
